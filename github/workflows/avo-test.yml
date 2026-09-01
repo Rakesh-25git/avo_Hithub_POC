@@ -1,1 +1,26 @@
+name: Avo Assure Test Execution
 
+on:
+  # Lets you press "Run workflow" manually from the Actions tab
+  workflow_dispatch:
+
+  # Runs automatically on every push to main
+  push:
+    branches:
+      - main
+
+jobs:
+  avo-execution:
+    name: Run Avo Assure tests
+    runs-on: ubuntu-latest        # PowerShell 7 (pwsh) is preinstalled here
+    timeout-minutes: 60           # safety net so a hung run cannot loop forever
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Avo Assure execution
+        shell: pwsh
+        env:
+          AVO_EXECUTION_KEY: ${{ secrets.AVO_EXECUTION_KEY }}
+        run: ./scripts/avo-test.ps1
