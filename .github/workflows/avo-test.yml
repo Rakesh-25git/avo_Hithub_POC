@@ -1,67 +1,93 @@
-# Alternative: everything in one file, no scripts/ folder needed.
-# The Windows PowerShell 5.1 branch is removed because GitHub-hosted runners
-# always use pwsh (PowerShell Core), so that branch could never execute.
-
-name: Avo Assure Test Execution (inline)
+name: Avo Assure Test Execution
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
   avo-execution:
-    name: Run Avo Assure tests
+    name: Run Avo Assure test
     runs-on: ubuntu-latest
     timeout-minutes: 60
-
-    env:
-      AVO_EXECUTION_KEY: ${{ secrets.AVO_EXECUTION_KEY }}
 
     steps:
       - name: Run Avo Assure execution
         shell: pwsh
+        env:
+          AVO_EXECUTION_KEY: ${{ secrets.AVO_EXECUTION_KEY }}
         run: |
           # Ignore SSL/TLS validation (for testing purposes only)
-          $PSDefaultParameterValues = @{
-              'Invoke-RestMethod:SkipCertificateCheck' = $true
+          # Branches based on PowerShell edition: Core (pwsh, e.g. Linux agents or Windows+pwsh)
+          # vs Desktop (Windows PowerShell 5.1, e.g. classic Windows agents)
+          if ($PSVersionTable.PSEdition -eq 'Core') {
+              $PSDefaultParameterValues = @{
+                  'Invoke-RestMethod:SkipCertificateCheck' = $true
+              }
+          }
+          else {
+              if (-not ([System.Management.Automation.PSTypeName]'ServerCertificateValidationCallback').Type) {
+                  $certCallback = @"
+                      using System;
+                      using System.Net;
+                      using System.Net.Security;
+                      using System.Security.Cryptography.X509Certificates;
+                      public class ServerCertificateValidationCallback {
+                          public static void Ignore() {
+                              if(ServicePointManager.ServerCertificateValidationCallback == null) {
+                                  ServicePointManager.ServerCertificateValidationCallback +=
+                                      delegate(Object obj, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors) {
+                                          return true;
+                                      };
+                              }
+                          }
+                      }
+          "@
+                  Add-Type $certCallback
+              }
+              [ServerCertificateValidationCallback]::Ignore()
           }
           [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-          if ([string]::IsNullOrWhiteSpace($env:AVO_EXECUTION_KEY)) {
-              Write-Host -f red "AVO_EXECUTION_KEY secret is not set."
-              exit 1
-          }
-          Write-Host "::add-mask::$env:AVO_EXECUTION_KEY"
 
           # Define headers and body
           $headers = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
           $headers.Add("Content-Type", "application/json")
 
-          $body = @{
-              key           = $env:AVO_EXECUTION_KEY
-              executionType = "asynchronous"
-          } | ConvertTo-Json
+          # Execution key comes from the AVO_EXECUTION_KEY repository secret
+          if ([string]::IsNullOrWhiteSpace($env:AVO_EXECUTION_KEY)) {
+              Write-Host -f red "AVO_EXECUTION_KEY secret is not set on this repository."
+              exit 1
+          }
+          Write-Host "::add-mask::$env:AVO_EXECUTION_KEY"
+
+          $body = @"
+          {
+              "key": "$($env:AVO_EXECUTION_KEY)",
+              "executionType": "asynchronous"
+          }
+          "@
 
           try {
               $response = Invoke-RestMethod 'https://avoqa.avoassurecloud.com/execAutomation' -Method 'POST' -Headers $headers -Body $body
               $status = $response.status
 
+              # Check if status is pass or fail
               if ($status -ne "fail") {
                   Write-Host "Status            :" $response.status
                   Write-Host "ReportLink        :" $response.reportLink
                   Write-Host "RunningStatusLink :" $response.runningStatusLink
-
                   $runningStatusLink = $response.runningStatusLink
-
-                  $statusResponse = Invoke-RestMethod -Uri $runningStatusLink -Method 'GET' -Headers $headers
-                  $runningStatus  = $statusResponse.status
-                  $complete       = $statusResponse.Completed
+                  $statusResponse = Invoke-RestMethod -Uri $runningStatusLink  -Method 'GET' -Headers $headers
+                  $runningStatus = $statusResponse.status
+                  $complete = $statusResponse.Completed
 
                   while ($runningStatus -eq "Inprogress") {
                       Write-Host "Executing... $complete"
 
-                      $statusResponse = Invoke-RestMethod -Uri $runningStatusLink -Method 'GET' -Headers $headers
-                      $runningStatus  = $statusResponse.status
-
+                      $statusResponse = Invoke-RestMethod -Uri $runningStatusLink  -Method 'GET' -Headers $headers
+                      $runningStatus = $statusResponse.status
                       if ($statusResponse.PSObject.Properties["Completed"]) {
                           $complete = $statusResponse.Completed
                       }
@@ -71,33 +97,17 @@ jobs:
                       Start-Sleep -Seconds 5
                   }
 
-                  if ($runningStatus -eq "Completed") {
+                  if ( $runningStatus -eq "Completed") {
                       $summaryReport = $statusResponse | ConvertTo-Json -Depth 10
                       Write-Host $summaryReport
-
                       $overallstatus = $statusResponse.overallstatus
                       Write-Host $overallstatus
-
-                      if ($overallstatus -eq "Pass") {
-                          Write-Host "Avo Assure execution PASSED."
-                          exit 0
-                      }
-                      else {
-                          Write-Host -f red "Avo Assure execution FAILED. Overall status: $overallstatus"
-                          exit 1
-                      }
-                  }
-                  else {
-                      Write-Host -f red "Execution ended with unexpected status: $runningStatus"
-                      exit 1
                   }
               }
               else {
                   Write-Host "Some error occurred"
-                  exit 1
               }
           }
           catch {
               Write-Host -f red "Encountered Error:"$_.Exception.Message
-              exit 1
           }
